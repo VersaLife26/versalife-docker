@@ -1,0 +1,89 @@
+# Cloudflare Tunnel ingress.
+#
+# =============================================================================
+# ORDER IS THE SECURITY MODEL
+# =============================================================================
+# cloudflared takes the FIRST matching rule. Every deny must therefore precede
+# the catch-all it is denying against. Moving a rule below the hostname rule
+# that follows it silently disables it.
+
+tunnel: ${TUNNEL_ID}
+credentials-file: /etc/cloudflared/credentials.json
+metrics: 127.0.0.1:2000
+no-autoupdate: true
+protocol: quic
+loglevel: info
+
+originRequest:
+  connectTimeout: 10s
+  tcpKeepAlive: 30s
+  # Longer than the gateway's own REQUEST_TIMEOUT (65s) so the origin is what
+  # times out and the error names the route rather than the tunnel.
+  keepAliveTimeout: 90s
+  keepAliveConnections: 32
+  noHappyEyeballs: true
+
+ingress:
+  # ---------------------------------------------------------------------------
+  # 1. Operational surface — never publicly reachable.
+  #
+  # /metrics is a full Prometheus dump: the route table, upstream names,
+  # per-route latency, circuit-breaker state. The instrumentation is kept in
+  # the code deliberately, but nothing scrapes it here, so the only thing an
+  # exposed /metrics can do is hand out a topology map.
+  #
+  # /health/ready names every domain's dependency checks, which is a free
+  # architecture diagram.
+  #
+  # 404 rather than 403: a 403 confirms the path exists.
+  # ---------------------------------------------------------------------------
+  - hostname: api.${TELEMED_DOMAIN}
+    path: ^/(metrics|health(/.*)?)$
+    service: http_status:404
+
+  # ---------------------------------------------------------------------------
+  # 2. The developer test surface.
+  #
+  # TELEMED_TEST_MODE defaults to TRUE and is only forced off by a
+  # production-like ENV. It mounts /api/v1/test/* unauthenticated and hands
+  # back the plaintext OTP for any phone number -- account takeover for every
+  # account on the platform. If a deploy ever ships with ENV=staging by
+  # accident, this rule is what stands between that and the internet.
+  # ---------------------------------------------------------------------------
+  - hostname: api.${TELEMED_DOMAIN}
+    path: ^/api/v1/test(/.*)?$
+    service: http_status:404
+
+  # ---------------------------------------------------------------------------
+  # 3. The API.
+  # ---------------------------------------------------------------------------
+  - hostname: api.${TELEMED_DOMAIN}
+    service: http://telemed-backend:8080
+
+  # ---------------------------------------------------------------------------
+  # 4. Video signalling, browser -> telemed-video, DIRECT.
+  #
+  # Deliberately NOT proxied through the gateway. The gateway assigns every
+  # route a timeout class (fast 5s / write 15s / upload 60s) and wraps handlers
+  # in a metrics ResponseWriter and a compression middleware -- none of which
+  # survives a hijacked connection, and the "fast" class would cut every
+  # consultation at five seconds. The platform has a Raw mount for exactly this
+  # reason.
+  #
+  # cloudflared proxies an Upgrade natively over an http:// service; the only
+  # requirement is not shortening the idle timeout below the handler's own
+  # 60s pong deadline.
+  # ---------------------------------------------------------------------------
+  - hostname: rtc.${TELEMED_DOMAIN}
+    path: ^/(metrics|health(/.*)?)$
+    service: http_status:404
+
+  - hostname: rtc.${TELEMED_DOMAIN}
+    service: http://telemed-video:8080
+    originRequest:
+      keepAliveTimeout: 120s
+
+  # ---------------------------------------------------------------------------
+  # 5. Everything else.
+  # ---------------------------------------------------------------------------
+  - service: http_status:404

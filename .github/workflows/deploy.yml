@@ -1,0 +1,65 @@
+name: deploy
+
+# Updating the VPS. Triggered by a release in telemed-backend, by a change to
+# the compose stack itself, or by hand.
+
+on:
+  repository_dispatch:
+    types: [deploy]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Serialise. Two concurrent deploys against one box is a half-recreated
+  # stack, and cancel-in-progress would abort one mid-migration.
+  group: vps-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install cloudflared
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m755 /tmp/cloudflared /usr/local/bin/cloudflared
+
+      - name: deploy over Cloudflare Access
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_SSH_HOSTNAME }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          : "${SSH_KEY:?VPS_SSH_KEY is not set}"
+          : "${VPS_HOST:?VPS_SSH_HOSTNAME is not set}"
+
+          install -d -m700 ~/.ssh
+          install -m600 /dev/null ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+
+          # Port 22 is not open on the VPS. SSH rides the same Cloudflare
+          # tunnel the API does, gated by an Access service token, so a stolen
+          # deploy key alone reaches nothing.
+          cat >> ~/.ssh/config <<CFG
+          Host vps
+            HostName ${VPS_HOST}
+            User ${VPS_USER:-deploy}
+            IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+            ProxyCommand /usr/local/bin/cloudflared access ssh --hostname %h
+          CFG
+
+          ssh vps 'cd /opt/versalife-docker && git pull --ff-only && ./scripts/deploy.sh'
