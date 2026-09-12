@@ -37,6 +37,20 @@ chmod 600 "$OUT"
 rand()  { openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'; }
 hex32() { openssl rand -hex 32 | tr -d '\n'; }
 
+# STANDARD base64, padding and all -- the opposite of rand() above, and not a
+# copy-paste slip.
+#
+# BANK_ENCRYPTION_KEY is not a password, it is a key that gets DECODED, by
+# base64.StdEncoding in internal/domain/doctor/doctor/crypto.go. Feed it the
+# URL-safe unpadded output of rand() and the doctor domain dies at boot with
+#
+#   fatal: build doctor domain: init bank encryptor: doctor: decode encryption
+#   key: illegal base64 data at input byte 40
+#
+# which names neither the setting nor the alphabet. The `-` and `_` that make
+# rand() safe inside a DSN are exactly what StdEncoding rejects.
+b64key() { openssl rand -base64 32 | tr -d '\n'; }
+
 # fill KEY GENERATOR -- sets KEY only when it is present and empty.
 fill() {
   local key=$1 value=$2
@@ -65,7 +79,7 @@ fill REDIS_PASSWORD              "$(rand)"
 fill NATS_PASSWORD               "$(rand)"
 
 echo "application secrets"
-fill BANK_ENCRYPTION_KEY         "$(rand)"
+fill BANK_ENCRYPTION_KEY         "$(b64key)"   # StdEncoding, see b64key
 fill FILESYSTEM_PRESIGN_SECRET   "$(rand)"
 fill SIGNAL_SECRET               "$(rand)"
 fill NOTIFICATION_WEBHOOK_SECRET "$(hex32)"
