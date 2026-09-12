@@ -1,7 +1,13 @@
 # versalife-docker
 
-The whole VersaLife platform on one Hetzner VPS: **4 GB RAM, 2 vCPU, 20 GB
-root, two 10 GB volumes.**
+The whole VersaLife platform on one Hetzner VPS: **3.5 GB RAM, 2 vCPU, 38 GB
+root, a 10 GB volume and an 11 GB volume.**
+
+The server is provisioned by
+[versalife-ansible](https://github.com/VersaLife26/versalife-ansible), which
+owns the volumes, the accounts, Docker, both Cloudflare tunnels and the
+secrets. Nothing below is done by hand any more; it is kept as the description
+of what that repo builds.
 
 Nothing here builds. Images come from GHCR, built by `telemed-backend`'s
 `release` workflow. A Go build of that module peaks well over 2 GB, which on
@@ -62,9 +68,9 @@ docker compose exec redis redis-cli -a "$REDIS_PASSWORD"
 The host firewall still has a job — deny everything inbound, allow nothing:
 
 ```bash
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-sudo ufw enable      # port 22 stays closed; SSH rides the tunnel
+sudo firewall-cmd --set-default-zone=drop     # Rocky ships firewalld, not ufw
+sudo firewall-cmd --permanent --zone=drop --remove-service=ssh
+sudo firewall-cmd --reload   # port 22 stays closed; SSH rides the tunnel
 ```
 
 ---
@@ -73,8 +79,11 @@ sudo ufw enable      # port 22 stays closed; SSH rides the tunnel
 
 ```bash
 # 0. Volumes. Both are attached disks, not directories on the 20 GB root.
-sudo mkdir -p /mnt/data/{postgres,redis,nats,backups} /mnt/objects
+sudo mkdir -p /mnt/data/{postgres,redis,nats} /mnt/files/{objects,backups}
 sudo chown -R 70:70 /mnt/data/postgres          # postgres:alpine runs as 70
+# backups/ is a SIBLING of objects/, never a child: telemed-backend serves
+# objects/ from /api/v1/files, and a pg_dump inside it is the patient database
+# behind a presigned URL.
 
 # 1. Secrets. Idempotent: safe to re-run, never rewrites what is already set.
 ./scripts/gen-secrets.sh
@@ -159,7 +168,7 @@ in-flight requests into it. If that is unacceptable the answer is a second
 VPS, not a cleverer script.
 
 **Backups are on the same box.** `deploy.sh` writes `pg_dump -Fc` to
-`/mnt/data/backups` before migrating and prunes at 14 days. That survives a
+`/mnt/files/backups` before migrating and prunes at 14 days. That survives a
 dropped table. It does not survive the VPS — ship them off-host, and back up
 `secrets/` separately, because losing it loses every encrypted column.
 

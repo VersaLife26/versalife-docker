@@ -1,0 +1,6 @@
+
+# Rendered by versalife-ansible from the .example beside it: the committed
+# version uses ${TUNNEL_ID} and ${TELEMED_DOMAIN}, and cloudflared does NOT
+# expand environment variables in its config file -- it would dial a tunnel
+# literally named "${TUNNEL_ID}".
+cloudflared/config.yml

@@ -248,7 +248,11 @@ services:
   telemed-backend:
     <<: *telemed
     container_name: telemed-backend
-    mem_limit: 1024m
+    # 896m, not 1024m. The box this actually runs on has 3557 MB, not the 4096
+    # this file was written against, and Hetzner gives it no swap: at 1024m the
+    # committed limits total 3072 MB and leave ~485 MB for the kernel, page
+    # cache, the host cloudflared holding the SSH tunnel open, and sshd.
+    mem_limit: 896m
     mem_reservation: 640m
     cpus: 1.5
     environment:
@@ -258,7 +262,7 @@ services:
       # not read the cgroup limit, so without it a container under memory
       # pressure gets OOM-killed instead of collecting harder. ~80% of
       # mem_limit leaves room for non-heap (stacks, the binary itself).
-      GOMEMLIMIT: 820MiB
+      GOMEMLIMIT: 716MiB
       GOMAXPROCS: "2"
       # user-service's gRPC directory, reached by telemed-notification. On the
       # internal `data` bridge only — it is a full PII directory.

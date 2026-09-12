@@ -17,7 +17,28 @@ exec 9>/var/lock/versalife-deploy.lock
 flock -n 9 || { echo "a deploy is already running"; exit 1; }
 
 COMPOSE=${COMPOSE:-docker compose}
-BACKUP_DIR=${BACKUP_DIR:-/mnt/data/backups}
+
+# The files volume, NOT the data volume, and NOT under $OBJECTS_VOLUME.
+#
+# telemed-backend bind-mounts the objects directory and serves it from
+# /api/v1/files behind presigned URLs. A backup directory inside that tree is
+# every pg_dump of the patient database sitting behind a public file endpoint.
+# They are siblings on the same volume for that reason.
+BACKUP_DIR=${BACKUP_DIR:-/mnt/files/backups}
+
+# docker-compose.yml interpolates five datastore passwords with ${...}, and the
+# compose CLI resolves those from ITS OWN environment and .env -- never from an
+# env_file, which only reaches the process inside a container. Without this the
+# very first command below dies with
+#
+#   error while interpolating services.postgres.environment.POSTGRES_PASSWORD:
+#   required variable POSTGRES_PASSWORD is missing a value
+#
+# .env already carries them, so this is belt and braces for anyone running the
+# script with a .env that predates that change.
+if [[ -f ./secrets/secrets.env ]]; then
+  set -a; . ./secrets/secrets.env; set +a
+fi
 
 echo "==> pulling"
 # Explicit, so a registry outage fails here rather than half way through a
@@ -77,8 +98,7 @@ fi
 echo "    all application containers healthy"
 
 echo "==> verifying the privilege boundary still holds"
-# shellcheck source=/dev/null
-set -a; . ./secrets/secrets.env; set +a
+# secrets.env is already in the environment, sourced at the top.
 ./scripts/verify-db-privileges.sh
 
 echo "==> pruning images older than a week"
