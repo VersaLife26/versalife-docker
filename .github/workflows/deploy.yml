@@ -38,8 +38,12 @@ jobs:
           SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
           VPS_HOST: ${{ secrets.VPS_SSH_HOSTNAME }}
           VPS_USER: ${{ secrets.VPS_USER }}
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          # The names cloudflared itself reads. CF_ACCESS_CLIENT_ID/SECRET are
+          # the HTTP header pair for an Access-protected URL; `access ssh`
+          # ignores them, falls back to a browser login no runner can complete,
+          # and fails with "failed to run transfer service".
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: |
           set -euo pipefail
           : "${SSH_KEY:?VPS_SSH_KEY is not set}"
