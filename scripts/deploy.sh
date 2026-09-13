@@ -23,14 +23,6 @@ flock -n 9 || { echo "a deploy is already running"; exit 1; }
 
 COMPOSE=${COMPOSE:-docker compose}
 
-# The files volume, NOT the data volume, and NOT under $OBJECTS_VOLUME.
-#
-# telemed-backend bind-mounts the objects directory and serves it from
-# /api/v1/files behind presigned URLs. A backup directory inside that tree is
-# every pg_dump of the patient database sitting behind a public file endpoint.
-# They are siblings on the same volume for that reason.
-BACKUP_DIR=${BACKUP_DIR:-/mnt/files/backups}
-
 # docker-compose.yml interpolates five datastore passwords with ${...}, and the
 # compose CLI resolves those from ITS OWN environment and .env -- never from an
 # env_file, which only reaches the process inside a container. Without this the
@@ -51,13 +43,15 @@ echo "==> pulling"
 $COMPOSE pull --quiet
 
 echo "==> backing up before any migration touches the schema"
-mkdir -p "$BACKUP_DIR"
-stamp=$(date -u +%Y%m%dT%H%M%SZ)
-$COMPOSE exec -T postgres pg_dump -U postgres -Fc telemed > "$BACKUP_DIR/telemed-$stamp.dump"
+# Through sudo, and through the SAME script the nightly timer runs, which
+# dumps, applies retention and chowns the result. This script runs as `deploy`
+# and the backup directory is 0700 backup:backup on purpose: a dump is the
+# entire patient database, so the account a CI deploy key reaches must not be
+# able to read one. --no-lock because the lock above is already held.
+#
 # Same box as the data. This survives a dropped table; it does not survive the
 # VPS. Ship these off-host separately.
-find "$BACKUP_DIR" -name '*.dump' -mtime +14 -delete
-echo "    $BACKUP_DIR/telemed-$stamp.dump"
+sudo -n /usr/local/bin/versalife-backup --no-lock
 
 echo "==> roles and grants"
 $COMPOSE up --no-deps --exit-code-from db-init db-init
