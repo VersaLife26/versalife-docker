@@ -4,3 +4,6 @@
 # expand environment variables in its config file -- it would dial a tunnel
 # literally named "${TUNNEL_ID}".
 cloudflared/config.yml
+
+# scripts/deploy.sh's flock target, created on the box by whoever deploys.
+.deploy.lock

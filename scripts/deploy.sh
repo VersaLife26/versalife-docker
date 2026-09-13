@@ -13,7 +13,12 @@ cd "$(dirname "$0")/.."
 
 # One deploy at a time. Two concurrent `docker compose up -d` runs against the
 # same project is how you get a half-recreated stack.
-exec 9>/var/lock/versalife-deploy.lock
+#
+# Beside the compose file, not in /var/lock: that directory is root-owned, and
+# this script runs as `deploy` -- both from the CI deploy over SSH and by hand.
+# The redirection is what creates the file, so it failed before flock was ever
+# reached, with "Permission denied" and no deploy.
+exec 9>./.deploy.lock
 flock -n 9 || { echo "a deploy is already running"; exit 1; }
 
 COMPOSE=${COMPOSE:-docker compose}
