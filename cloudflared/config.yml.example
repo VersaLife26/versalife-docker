@@ -42,26 +42,13 @@ ingress:
     service: http_status:404
 
   # ---------------------------------------------------------------------------
-  # 2. The developer test surface.
-  #
-  # TELEMED_TEST_MODE defaults to TRUE and is only forced off by a
-  # production-like ENV. It mounts /api/v1/test/* unauthenticated and hands
-  # back the plaintext OTP for any phone number -- account takeover for every
-  # account on the platform. If a deploy ever ships with ENV=staging by
-  # accident, this rule is what stands between that and the internet.
-  # ---------------------------------------------------------------------------
-  - hostname: api.${TELEMED_DOMAIN}
-    path: ^/api/v1/test(/.*)?$
-    service: http_status:404
-
-  # ---------------------------------------------------------------------------
-  # 3. The API.
+  # 2. The API. /api/v1/test/* is deliberately reachable (TELEMED_TEST_MODE).
   # ---------------------------------------------------------------------------
   - hostname: api.${TELEMED_DOMAIN}
     service: http://telemed-backend:8080
 
   # ---------------------------------------------------------------------------
-  # 4. Video signalling, browser -> telemed-video, DIRECT.
+  # 3. Video signalling, browser -> telemed-video, DIRECT.
   #
   # Deliberately NOT proxied through the gateway. The gateway assigns every
   # route a timeout class (fast 5s / write 15s / upload 60s) and wraps handlers
@@ -84,6 +71,6 @@ ingress:
       keepAliveTimeout: 120s
 
   # ---------------------------------------------------------------------------
-  # 5. Everything else.
+  # 4. Everything else.
   # ---------------------------------------------------------------------------
   - service: http_status:404
