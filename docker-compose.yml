@@ -289,6 +289,9 @@ services:
     environment:
       TELEMED_DOMAINS: consultation
       HTTP_PORT: "8080"
+      # Test mode is served by telemed-backend only. In a single-domain process
+      # the test module is a second Mount("/") and chi panics at boot.
+      TELEMED_TEST_MODE: "false"
       GOMEMLIMIT: 300MiB
       GOMAXPROCS: "2"
     healthcheck:
@@ -307,6 +310,8 @@ services:
     environment:
       TELEMED_DOMAINS: notification
       HTTP_PORT: "8080"
+      # See telemed-video.
+      TELEMED_TEST_MODE: "false"
       GOMEMLIMIT: 250MiB
       GOMAXPROCS: "2"
     healthcheck:
