@@ -159,6 +159,25 @@ BEGIN
     EXECUTE format('GRANT CONNECT ON DATABASE telemed TO %I', role_n);
     EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I', schema_n, role_n);
 
+    -- TEMPORARY, for scheduling ALONE.
+    --
+    -- Slot generation stages a night's slots in a CREATE TEMP TABLE ... ON
+    -- COMMIT DROP and merges them with ON CONFLICT DO NOTHING (CopySlots in
+    -- telemed-backend). Without this grant that CREATE fails with "permission
+    -- denied to create temporary tables", every generation run aborts, and the
+    -- platform quietly stops materialising slots -- which is not a visible
+    -- outage, it is a booking calendar that silently stops growing. It ran for
+    -- a week: 485 slots, all created on the day of the first deploy, and every
+    -- doctor who opened up a new day afterwards got nothing.
+    --
+    -- Granted to ONE role rather than to all eight in the loop. pg_temp is
+    -- per-session and dropped at disconnect, so this is the narrowest
+    -- exception to "the app role must never do DDL" that makes the scheduler
+    -- work, and the other seven domains keep the property intact.
+    IF d = 'scheduling' THEN
+      EXECUTE format('GRANT TEMPORARY ON DATABASE telemed TO %I', role_n);
+    END IF;
+
     -- 3e. USAGE on public, for pgcrypto. NOT CREATE: public is on every
     -- domain's search_path, so CREATE there is a shadowing attack against all
     -- eight domains at once.
