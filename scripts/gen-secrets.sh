@@ -2,22 +2,16 @@
 #
 # Generate the machine-generated half of secrets/secrets.env.
 #
-# IDEMPOTENT AND NON-DESTRUCTIVE. It only fills keys that are empty, and it
-# refuses to touch two of them ever:
-#
-#   NIC_HASH_PEPPER          rotating it orphans every hashed NIC
-#   PRESCRIPTION_HMAC_SECRET rotating it invalidates every issued QR
-#
-# Both are data-migration events, not config changes, so they are generated
-# once on a fresh file and never rewritten.
+# IDEMPOTENT AND NON-DESTRUCTIVE. It only fills keys that are missing or
+# empty, so re-running it never rotates anything. Crypto__BankDataKey and
+# Prescriptions__HmacKey in particular are one-way doors: rotating them
+# orphans stored bank details and invalidates every issued prescription QR.
 #
 #   ./scripts/gen-secrets.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 OUT=secrets/secrets.env
-KEY=secrets/jwt-key.pem
-OVERRIDE=secrets/secrets.override.yml
 
 mkdir -p secrets
 if [[ ! -f "$OUT" ]]; then
@@ -26,32 +20,14 @@ if [[ ! -f "$OUT" ]]; then
 fi
 chmod 600 "$OUT"
 
-# URL-SAFE base64, and that is not cosmetic.
-#
-# TELEMED_APP_DB_PASSWORD ends up inside DATABASE_URL and NATS_PASSWORD inside
-# NATS_URL, and cmd/telemed parses both with net/url. A "/" in a password makes
-# url.Parse fail with `invalid port ":ab" after host` -- so a plain base64
-# password breaks boot roughly every other time it is generated, with an error
-# that names neither the password nor the setting. Swapping +/ for -_ keeps all
-# 256 bits and removes the class entirely.
+# URL-safe and unpadded: TELEMED_API_DB_PASSWORD is spliced into a Npgsql
+# connection string, where `;` and `=` would be read as separators.
 rand()  { openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'; }
 hex32() { openssl rand -hex 32 | tr -d '\n'; }
-
-# STANDARD base64, padding and all -- the opposite of rand() above, and not a
-# copy-paste slip.
-#
-# BANK_ENCRYPTION_KEY is not a password, it is a key that gets DECODED, by
-# base64.StdEncoding in internal/domain/doctor/doctor/crypto.go. Feed it the
-# URL-safe unpadded output of rand() and the doctor domain dies at boot with
-#
-#   fatal: build doctor domain: init bank encryptor: doctor: decode encryption
-#   key: illegal base64 data at input byte 40
-#
-# which names neither the setting nor the alphabet. The `-` and `_` that make
-# rand() safe inside a DSN are exactly what StdEncoding rejects.
+# Standard base64 WITH padding: Crypto__BankDataKey is decoded, and must be exactly 32 bytes.
 b64key() { openssl rand -base64 32 | tr -d '\n'; }
 
-# fill KEY GENERATOR -- sets KEY only when it is present and empty.
+# fill KEY VALUE -- sets KEY only when it is missing or empty.
 fill() {
   local key=$1 value=$2
   if ! grep -q "^${key}=" "$OUT"; then
@@ -63,109 +39,34 @@ fill() {
     echo "  keep    $key (already set)"
     return
   fi
-  # The value can contain / and &, so use a delimiter they cannot be, and
-  # escape the replacement for sed.
   local esc=${value//\\/\\\\}
   esc=${esc//|/\\|}
+  esc=${esc//&/\\&}
   sed -i "s|^${key}=.*|${key}=${esc}|" "$OUT"
   echo "  set     $key"
 }
 
-echo "infrastructure passwords"
-fill POSTGRES_PASSWORD           "$(rand)"
-fill TELEMED_MIGRATOR_PASSWORD   "$(rand)"
-fill TELEMED_APP_DB_PASSWORD     "$(rand)"
-fill REDIS_PASSWORD              "$(rand)"
-fill NATS_PASSWORD               "$(rand)"
+echo "database"
+fill POSTGRES_PASSWORD       "$(rand)"
+fill TELEMED_API_DB_PASSWORD "$(rand)"
 
-echo "application secrets"
-fill BANK_ENCRYPTION_KEY         "$(b64key)"   # StdEncoding, see b64key
-fill FILESYSTEM_PRESIGN_SECRET   "$(rand)"
-fill SIGNAL_SECRET               "$(rand)"
-fill NOTIFICATION_WEBHOOK_SECRET "$(hex32)"
-
-echo "one-time-only secrets (never rotated by this script)"
-fill NIC_HASH_PEPPER             "$(rand)"
-fill PRESCRIPTION_HMAC_SECRET    "$(hex32)"
-
-# DATABASE_URL has to carry the app password that was just generated.
-app_pw=$(sed -n 's/^TELEMED_APP_DB_PASSWORD=//p' "$OUT")
-if grep -q '^DATABASE_URL=.*CHANGEME' "$OUT"; then
-  sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgres://telemed_user_app:${app_pw}@postgres:5432/telemed?sslmode=disable|" "$OUT"
-  echo "  set     DATABASE_URL"
-else
-  echo "  keep    DATABASE_URL (already set)"
-fi
-
-# NATS credentials go IN the URL: events.NewNATS takes NATS_URL and there is no
-# separate password setting for it. That is also why NATS_URL lives in
-# secrets.env and not in the committed env/common.env.
-nats_pw=$(sed -n 's/^NATS_PASSWORD=//p' "$OUT")
-if grep -q '^NATS_URL=.*CHANGEME' "$OUT" || ! grep -q '^NATS_URL=' "$OUT"; then
-  if grep -q '^NATS_URL=' "$OUT"; then
-    sed -i "s|^NATS_URL=.*|NATS_URL=nats://telemed:${nats_pw}@nats:4222|" "$OUT"
-  else
-    printf 'NATS_URL=nats://telemed:%s@nats:4222\n' "$nats_pw" >> "$OUT"
-  fi
-  echo "  set     NATS_URL"
-else
-  echo "  keep    NATS_URL (already set)"
-fi
-
-# ---------------------------------------------------------------------------
-# The JWT signing key, and why it does not live in secrets.env.
-#
-# pem.Decode needs REAL newlines. An env_file has no line-continuation syntax,
-# so a PEM pasted into one is truncated at the first line -- and the user
-# domain then falls back to GenerateEphemeralKeyPEM, minting tokens with a key
-# that changes on every restart. Every session dies on every deploy and
-# nothing logs an error.
-#
-# A compose override with a YAML block scalar does support newlines, so the
-# key goes there instead.
-# ---------------------------------------------------------------------------
-if [[ ! -f "$KEY" ]]; then
-  openssl genrsa -out "$KEY" 2048 2>/dev/null
-  chmod 600 "$KEY"
-  echo "  set     JWT_PRIVATE_KEY_PEM -> $KEY"
-else
-  echo "  keep    $KEY (already present)"
-fi
-
-{
-  echo "# GENERATED by scripts/gen-secrets.sh. Do not edit, do not commit."
-  echo "#"
-  echo "# A YAML block scalar is the only place in this stack that can carry a"
-  echo "# multiline PEM. See the script for what breaks otherwise."
-  echo "services:"
-  for svc in telemed-backend telemed-video telemed-notification; do
-    echo "  ${svc}:"
-    echo "    environment:"
-    echo "      JWT_PRIVATE_KEY_PEM: |"
-    sed 's/^/        /' "$KEY"
-  done
-} > "$OVERRIDE"
-chmod 600 "$OVERRIDE"
-echo "  wrote   $OVERRIDE"
+echo "application keys"
+fill Auth__Jwt__SigningKey   "$(rand)"
+fill Otp__HmacKey            "$(rand)"
+fill Storage__SigningKey     "$(rand)"
+fill Video__RoomTokenKey     "$(rand)"
+fill Crypto__BankDataKey     "$(b64key)"
+fill Prescriptions__HmacKey  "$(hex32)"
 
 cat <<'NEXT'
 
-Done. Two things are NOT generated and must be filled in by hand:
+Done. Not generated -- versalife-ansible writes these from its vault, or fill
+them in by hand:
 
-  1. Cloudflare      TELEMED_DOMAIN, TUNNEL_ID, ADMIN_ISSUER, ADMIN_JWKS_URL,
-                     ICE_TURN_SECRET, ADMIN_IP_ALLOWLIST, and
-                     secrets/tunnel-credentials.json from `cloudflared tunnel create`.
-  2. Payment / SMS   DIALOG_*, STRIPE_*, PAYHERE_*, SMTP_*.
+  Cloudflare Access  AdminAuth__CloudflareAccess__{TeamDomain,Audience}, AdminAuth__IpAllowlist__0
+  Origins            Cors__Origins__*, Cors__AdminOrigins__*, AppLinks__PatientAppUrl
+  Rails              Turn__Cloudflare__*, Sms__*, Email__*, Payments__PayHere__*
+  Test inbox         Testing__SharedSecret (16+ chars; the frontend sends it as X-Test-Secret)
 
-Then mint the mesh token, which has to be signed by the key just generated:
-
-  docker compose run --rm --no-deps \
-    -e JWT_PRIVATE_KEY_PEM="$(cat secrets/jwt-key.pem)" \
-    telemed-backend mint-service-token notification-service 8760h
-
-and put the printed token in MESH_STATIC_TOKEN.
-
-Add to /opt/versalife-docker/.env so the override is always applied:
-
-  COMPOSE_FILE=docker-compose.yml:secrets/secrets.override.yml
+and secrets/tunnel-credentials.json from `cloudflared tunnel create`.
 NEXT

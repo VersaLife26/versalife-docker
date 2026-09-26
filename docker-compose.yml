@@ -3,20 +3,10 @@
 # =============================================================================
 # THIS FILE NEVER BUILDS ANYTHING
 # =============================================================================
-# There is no `build:` key here and adding one is a mistake: a Go build of this
-# module peaks well over 2 GB, which on a 4 GB box means the OOM killer picks a
-# victim, and the victim is whatever has the largest resident set — Postgres.
-# Images are built by GitHub Actions and pulled. `pull_policy: always` is what
-# makes `docker compose up -d` on a :latest tag actually fetch a new digest.
-#
-# =============================================================================
-# ONE IMAGE, THREE CONTAINERS
-# =============================================================================
-# telemed-backend, telemed-video and telemed-notification are the SAME image
-# with different TELEMED_DOMAINS. cmd/telemed selects which domains it composes
-# at run time; that is what the nine-service consolidation was for. Three
-# entrypoints would duplicate the composer three ways to save dead text that
-# costs nothing at run time.
+# There is no `build:` key here and adding one is a mistake: an SDK build on a
+# 3.5 GB box competes with Postgres for memory. telemed-api's release workflow
+# builds the image and pushes it to GHCR. `pull_policy: always` is what makes
+# `docker compose up -d` on a :latest tag actually fetch a new digest.
 #
 # =============================================================================
 # NOTHING IS PUBLISHED
@@ -26,12 +16,10 @@
 # decoration: Docker's port publishing inserts its own iptables chain that is
 # consulted BEFORE the rules ufw and firewalld write, so `-p 5432:5432` on a
 # VPS exposes Postgres to the internet while `ufw status` truthfully reports
-# the port as denied. Every "we found your patient database on Shodan" story
-# starts exactly there.
+# the port as denied.
 #
 # To get a shell, go through the container, not a port:
-#   docker compose exec postgres psql -U postgres telemed
-#   docker compose exec redis redis-cli -a "$REDIS_PASSWORD"
+#   docker compose exec postgres psql -U postgres telemed_api
 
 name: versalife
 
@@ -40,72 +28,33 @@ x-logging: &logging
     driver: json-file
     options: { max-size: "10m", max-file: "3" }
 
-# Everything the three application containers share. Only TELEMED_DOMAINS and
-# the resource limits differ between them.
-x-telemed: &telemed
-  image: ghcr.io/versalife26/telemed-backend:latest
-  pull_policy: always
-  restart: unless-stopped
-  <<: *logging
-  networks: [edge, data]
-  security_opt: [no-new-privileges:true]
-  cap_drop: [ALL]
-  # The image is FROM scratch with one static binary. Nothing writes to the
-  # root filesystem, so there is nothing to gain by leaving it writable.
-  read_only: true
-  tmpfs: [/tmp]
-  # Must exceed SHUTDOWN_GRACE (20s) or SIGKILL lands mid-drain.
-  stop_grace_period: 30s
-  env_file: [./env/common.env, ./secrets/secrets.env]
-  depends_on:
-    postgres: { condition: service_healthy }
-    redis: { condition: service_healthy }
-    nats: { condition: service_healthy }
-    migrate: { condition: service_completed_successfully }
-
 networks:
-  # cloudflared <-> the application containers. Has egress, because the
-  # backend must reach Dialog, PayHere and Stripe.
+  # cloudflared <-> telemed-api. Has egress, because the API must reach
+  # PayHere, SMTP, Dialog and Cloudflare TURN.
   edge:
     driver: bridge
-  # The datastores. internal:true gives them no default route out at all.
+  # The database. internal:true gives it no default route out at all.
   data:
     driver: bridge
     internal: true
 
 volumes:
-  # Both bind-mount the two attached 10 GB volumes. Named volumes on the root
-  # disk would silently fill the 20 GB system disk instead.
+  # Bind mounts onto the two attached volumes. Named volumes on the root disk
+  # would silently fill the system disk instead.
   pgdata:
     driver: local
     driver_opts:
       type: none
       o: bind
       device: "${DATA_VOLUME:-/mnt/data}/postgres"
-  redisdata:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: "${DATA_VOLUME:-/mnt/data}/redis"
-  natsdata:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: "${DATA_VOLUME:-/mnt/data}/nats"
   objects:
     driver: local
     driver_opts:
       type: none
       o: bind
-      device: "${OBJECTS_VOLUME:-/mnt/objects}"
+      device: "${OBJECTS_VOLUME:-/mnt/files/api-files}"
 
 services:
-  # ---------------------------------------------------------------------------
-  # datastores
-  # ---------------------------------------------------------------------------
-
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
@@ -129,71 +78,15 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d telemed -q"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres -q"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 30s
 
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    <<: *logging
-    networks: [data]
-    mem_limit: 192m
-    mem_reservation: 128m
-    cpus: 0.5
-    # requirepass on the command line, not in redis.conf: the config file is
-    # mounted read-only from this repo and must never carry the secret.
-    command:
-      - redis-server
-      - /usr/local/etc/redis/redis.conf
-      - --requirepass
-      - ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
-    environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
-    volumes:
-      - redisdata:/data
-      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
-    healthcheck:
-      test: ["CMD-SHELL", 'redis-cli -a "$$REDIS_PASSWORD" --no-auth-warning PING | grep -q PONG']
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
-
-  nats:
-    image: nats:2.10-alpine
-    restart: unless-stopped
-    <<: *logging
-    networks: [data]
-    mem_limit: 256m
-    mem_reservation: 128m
-    cpus: 0.5
-    command: ["-c", "/etc/nats/nats.conf"]
-    environment:
-      NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD is required}
-    volumes:
-      - natsdata:/data/jetstream
-      - ./nats/nats.conf:/etc/nats/nats.conf:ro
-    healthcheck:
-      # js-enabled-only, not plain /healthz: the latter returns 200 before
-      # JetStream is ready, and every publisher on this platform needs
-      # JetStream specifically.
-      test: ["CMD-SHELL", "wget -q -O- 'http://127.0.0.1:8222/healthz?js-enabled-only=true' | grep -q ok"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 15s
-
-  # ---------------------------------------------------------------------------
-  # one-shot: roles and grants, then migrations
-  #
-  # Both must finish before any application container starts, and both are
-  # restart:"no" — with `unless-stopped` a container that exits 0 is restarted
-  # forever and Compose never observes "completed successfully".
-  # ---------------------------------------------------------------------------
-
+  # One-shot: the telemed_api role and database. restart:"no" -- with
+  # `unless-stopped` a container that exits 0 is restarted forever and Compose
+  # never observes "completed successfully".
   db-init:
     image: postgres:17-alpine
     restart: "no"
@@ -215,115 +108,42 @@ services:
       - -U
       - postgres
       - -d
-      - telemed
+      - postgres
       - -v
-      - migrator_password=${TELEMED_MIGRATOR_PASSWORD:?TELEMED_MIGRATOR_PASSWORD is required}
-      - -v
-      - app_password=${TELEMED_APP_DB_PASSWORD:?TELEMED_APP_DB_PASSWORD is required}
+      - api_password=${TELEMED_API_DB_PASSWORD:?TELEMED_API_DB_PASSWORD is required}
       - -f
-      - /init/01-roles-and-grants.sql
+      - /init/01-telemed-api.sql
 
-  migrate:
-    image: ghcr.io/versalife26/telemed-migrate:latest
+  telemed-api:
+    image: ghcr.io/versalife26/telemed-api:latest
     pull_policy: always
-    restart: "no"
-    networks: [data]
-    mem_limit: 256m
+    container_name: telemed-api
+    restart: unless-stopped
     <<: *logging
-    depends_on:
-      db-init: { condition: service_completed_successfully }
-    environment:
-      # As telemed_migrator, not the superuser. The migrator owns every svc_
-      # schema, which is what makes the append-only REVOKEs in the admin and
-      # record migrations mean something: the app roles are not the owner and
-      # cannot grant themselves back what was revoked.
-      DATABASE_URL: postgres://telemed_migrator:${TELEMED_MIGRATOR_PASSWORD:?}@postgres:5432/telemed?sslmode=disable
-    # No arguments: migrate.sh with no domains runs bootstrap and then all
-    # eight, which is what one process owning the whole schema wants.
-
-  # ---------------------------------------------------------------------------
-  # application — one image, three roles
-  # ---------------------------------------------------------------------------
-
-  telemed-backend:
-    <<: *telemed
-    container_name: telemed-backend
-    # 896m, not 1024m. The box this actually runs on has 3557 MB, not the 4096
-    # this file was written against, and Hetzner gives it no swap: at 1024m the
-    # committed limits total 3072 MB and leave ~485 MB for the kernel, page
-    # cache, the host cloudflared holding the SSH tunnel open, and sshd.
-    mem_limit: 896m
-    mem_reservation: 640m
+    networks: [edge, data]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    mem_limit: 768m
+    mem_reservation: 384m
     cpus: 1.5
+    stop_grace_period: 30s
+    env_file: [./env/common.env, ./secrets/secrets.env]
     environment:
-      TELEMED_DOMAINS: user,doctor,scheduling,payment,record,admin,edge
-      HTTP_PORT: "8080"
-      # GOMEMLIMIT is the highest-value line in this file. The Go runtime does
-      # not read the cgroup limit, so without it a container under memory
-      # pressure gets OOM-killed instead of collecting harder. ~80% of
-      # mem_limit leaves room for non-heap (stacks, the binary itself).
-      GOMEMLIMIT: 716MiB
-      GOMAXPROCS: "2"
-      # user-service's gRPC directory, reached by telemed-notification. On the
-      # internal `data` bridge only — it is a full PII directory.
-      EXPOSE_GRPC: "true"
+      # Here rather than in secrets.env: the connection string contains `;`,
+      # which breaks any shell that sources an env file.
+      Database__ConnectionString: "Host=postgres;Port=5432;Database=telemed_api;Username=telemed_api;Password=${TELEMED_API_DB_PASSWORD:?};GSS Encryption Mode=Disable"
     volumes:
-      - objects:/data/objects
+      - objects:/var/lib/telemed/files
+    depends_on:
+      postgres: { condition: service_healthy }
+      db-init: { condition: service_completed_successfully }
     healthcheck:
-      # The image is FROM scratch: no shell, no curl, no wget. The binary
-      # probes itself. /health/ready and not /health/live, because a process
-      # that is up but cannot reach Postgres should not receive traffic.
-      test: ["CMD", "/server", "healthcheck"]
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf \"GET /health/ready HTTP/1.0\\r\\n\\r\\n\" >&3 && grep -q \" 200 \" <&3'"]
       interval: 15s
       timeout: 5s
       retries: 5
-      # Six domains, six pgx pools, all pinged by the readiness handler.
-      start_period: 60s
-
-  telemed-video:
-    <<: *telemed
-    container_name: telemed-video
-    mem_limit: 384m
-    mem_reservation: 192m
-    cpus: 0.75
-    environment:
-      TELEMED_DOMAINS: consultation
-      HTTP_PORT: "8080"
-      # Test mode is served by telemed-backend only. In a single-domain process
-      # the test module is a second Mount("/") and chi panics at boot.
-      TELEMED_TEST_MODE: "false"
-      GOMEMLIMIT: 300MiB
-      GOMAXPROCS: "2"
-    healthcheck:
-      test: ["CMD", "/server", "healthcheck"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-
-  telemed-notification:
-    <<: *telemed
-    container_name: telemed-notification
-    mem_limit: 320m
-    mem_reservation: 160m
-    cpus: 0.5
-    environment:
-      TELEMED_DOMAINS: notification
-      HTTP_PORT: "8080"
-      # See telemed-video.
-      TELEMED_TEST_MODE: "false"
-      GOMEMLIMIT: 250MiB
-      GOMAXPROCS: "2"
-    healthcheck:
-      test: ["CMD", "/server", "healthcheck"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-
-  # ---------------------------------------------------------------------------
-  # edge
-  # ---------------------------------------------------------------------------
+      # EF migrations run before the API starts serving.
+      start_period: 90s
 
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -345,5 +165,4 @@ services:
       - ./cloudflared/config.yml:/etc/cloudflared/config.yml:ro
       - ./secrets/tunnel-credentials.json:/etc/cloudflared/credentials.json:ro
     depends_on:
-      telemed-backend: { condition: service_healthy }
-      telemed-video: { condition: service_healthy }
+      telemed-api: { condition: service_healthy }

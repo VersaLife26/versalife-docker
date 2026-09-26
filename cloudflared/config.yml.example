@@ -17,60 +17,33 @@ loglevel: info
 originRequest:
   connectTimeout: 10s
   tcpKeepAlive: 30s
-  # Longer than the gateway's own REQUEST_TIMEOUT (65s) so the origin is what
-  # times out and the error names the route rather than the tunnel.
   keepAliveTimeout: 90s
   keepAliveConnections: 32
   noHappyEyeballs: true
 
 ingress:
   # ---------------------------------------------------------------------------
-  # 1. Operational surface — never publicly reachable.
+  # 1. Operational surface -- never publicly reachable.
   #
-  # /metrics is a full Prometheus dump: the route table, upstream names,
-  # per-route latency, circuit-breaker state. The instrumentation is kept in
-  # the code deliberately, but nothing scrapes it here, so the only thing an
-  # exposed /metrics can do is hand out a topology map.
-  #
-  # /health/ready names every domain's dependency checks, which is a free
-  # architecture diagram.
-  #
-  # 404 rather than 403: a 403 confirms the path exists.
+  # /health/ready names the API's dependency checks. 404 rather than 403: a
+  # 403 confirms the path exists.
   # ---------------------------------------------------------------------------
   - hostname: api.${TELEMED_DOMAIN}
-    path: ^/(metrics|health(/.*)?)$
+    path: ^/health(/.*)?$
     service: http_status:404
 
   # ---------------------------------------------------------------------------
-  # 2. The API. /api/v1/test/* is deliberately reachable (TELEMED_TEST_MODE).
+  # 2. The API, including the SignalR hub at /hubs/consultation. cloudflared
+  # proxies the WebSocket upgrade natively; the longer keepalive outlasts the
+  # hub's own keep-alive pings.
+  # /api/v1/test/* is reachable but needs X-Test-Secret.
   # ---------------------------------------------------------------------------
   - hostname: api.${TELEMED_DOMAIN}
-    service: http://telemed-backend:8080
-
-  # ---------------------------------------------------------------------------
-  # 3. Video signalling, browser -> telemed-video, DIRECT.
-  #
-  # Deliberately NOT proxied through the gateway. The gateway assigns every
-  # route a timeout class (fast 5s / write 15s / upload 60s) and wraps handlers
-  # in a metrics ResponseWriter and a compression middleware -- none of which
-  # survives a hijacked connection, and the "fast" class would cut every
-  # consultation at five seconds. The platform has a Raw mount for exactly this
-  # reason.
-  #
-  # cloudflared proxies an Upgrade natively over an http:// service; the only
-  # requirement is not shortening the idle timeout below the handler's own
-  # 60s pong deadline.
-  # ---------------------------------------------------------------------------
-  - hostname: rtc.${TELEMED_DOMAIN}
-    path: ^/(metrics|health(/.*)?)$
-    service: http_status:404
-
-  - hostname: rtc.${TELEMED_DOMAIN}
-    service: http://telemed-video:8080
+    service: http://telemed-api:8080
     originRequest:
       keepAliveTimeout: 120s
 
   # ---------------------------------------------------------------------------
-  # 4. Everything else.
+  # 3. Everything else.
   # ---------------------------------------------------------------------------
   - service: http_status:404
